@@ -1,0 +1,121 @@
+package com.example.contactadder;
+
+import android.content.Intent;
+import android.os.Bundle;
+import android.provider.ContactsContract;
+import android.widget.Button;
+import android.widget.Toast;
+
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AppCompatActivity;
+
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.IOException;
+
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+public class ContactResponseActivity extends AppCompatActivity {
+
+    private final OkHttpClient client = new OkHttpClient();
+    private String name;
+    private String phoneNumber;
+
+    // Create a launcher for starting activity for result
+    private final ActivityResultLauncher<Intent> addContactLauncher = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(),
+            result -> {
+                if (result.getResultCode() == RESULT_OK) {
+                    Toast.makeText(this, "Contact added successfully", Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(this, "Contact not added", Toast.LENGTH_SHORT).show();
+                }
+            });
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        Button getContactButton = findViewById(R.id.get_contact_button);
+        getContactButton.setOnClickListener(v -> {
+            // Call the API to get the response
+            getResponse();
+        });
+    }
+
+    private void getResponse() {
+        // Example API request - replace with your actual API endpoint
+        String url = "https://api.example.com/contact-info";
+        Request request = new Request.Builder()
+                .url(url)
+                .build();
+
+        client.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                runOnUiThread(() -> 
+                    Toast.makeText(ContactResponseActivity.this, 
+                                  "Failed to get response: " + e.getMessage(), 
+                                  Toast.LENGTH_SHORT).show()
+                );
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                if (!response.isSuccessful()) {
+                    runOnUiThread(() -> 
+                        Toast.makeText(ContactResponseActivity.this, 
+                                      "Unexpected response: " + response, 
+                                      Toast.LENGTH_SHORT).show()
+                    );
+                    return;
+                }
+
+                try {
+                    // Parse the response - adjust according to your actual response format
+                    String responseBody = response.body().string();
+                    JSONObject jsonResponse = new JSONObject(responseBody);
+                    
+                    // Extract name and phone number - adjust the JSON keys as needed
+                    name = jsonResponse.getString("name");
+                    phoneNumber = jsonResponse.getString("phone");
+
+                    // Launch the contacts app from the main thread
+                    runOnUiThread(() -> launchContactsApp(name, phoneNumber));
+                    
+                } catch (JSONException e) {
+                    runOnUiThread(() -> 
+                        Toast.makeText(ContactResponseActivity.this, 
+                                      "Error parsing response: " + e.getMessage(), 
+                                      Toast.LENGTH_SHORT).show()
+                    );
+                }
+            }
+        });
+    }
+
+    private void launchContactsApp(String name, String phoneNumber) {
+        // Create intent to insert a new contact
+        Intent intent = new Intent(Intent.ACTION_INSERT);
+        intent.setType(ContactsContract.Contacts.CONTENT_TYPE);
+        
+        // Add the contact data
+        intent.putExtra(ContactsContract.Intents.Insert.NAME, name);
+        intent.putExtra(ContactsContract.Intents.Insert.PHONE, phoneNumber);
+        
+        // Check if there's an app that can handle this intent
+        if (intent.resolveActivity(getPackageManager()) != null) {
+            // Launch using the activity result launcher
+            addContactLauncher.launch(intent);
+        } else {
+            Toast.makeText(this, "No contacts app available", Toast.LENGTH_SHORT).show();
+        }
+    }
+}
