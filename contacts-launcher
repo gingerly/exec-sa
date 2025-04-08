@@ -1,121 +1,198 @@
-package com.example.contactadder;
+package io.shubham0204.smollmandroid.ui.screens.chat
 
-import android.content.Intent;
-import android.os.Bundle;
-import android.provider.ContactsContract;
-import android.widget.Button;
-import android.widget.Toast;
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.Intent
+import android.graphics.Color
+import android.text.util.Linkify
+import android.util.Log
+import android.util.TypedValue
+import androidx.core.content.ContextCompat
+import androidx.core.content.res.ResourcesCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import io.noties.markwon.AbstractMarkwonPlugin
+import io.noties.markwon.Markwon
+import io.noties.markwon.core.CorePlugin
+import io.noties.markwon.core.MarkwonTheme
+import io.noties.markwon.ext.latex.JLatexMathPlugin
+import io.noties.markwon.html.HtmlPlugin
+import io.noties.markwon.inlineparser.MarkwonInlineParserPlugin
+import io.noties.markwon.linkify.LinkifyPlugin
+import io.noties.markwon.syntax.Prism4jThemeDarkula
+import io.noties.markwon.syntax.SyntaxHighlightPlugin
+import io.noties.prism4j.Prism4j
+import io.shubham0204.smollmandroid.R
+import io.shubham0204.smollmandroid.data.Chat
+import io.shubham0204.smollmandroid.data.ChatMessage
+import io.shubham0204.smollmandroid.data.ChatsDB
+import io.shubham0204.smollmandroid.data.MessagesDB
+import io.shubham0204.smollmandroid.data.TasksDB
+import io.shubham0204.smollmandroid.llm.ModelsRepository
+import io.shubham0204.smollmandroid.llm.SmolLMManager
+import io.shubham0204.smollmandroid.prism4j.PrismGrammarLocator
+import io.shubham0204.smollmandroid.ui.components.createAlertDialog
+import io.shubham0204.smollmandroid.ui.screens.contact.ContactAddActivity
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import org.koin.android.annotation.KoinViewModel
+import java.util.Date
+import java.util.regex.Pattern
 
-import androidx.activity.result.ActivityResultLauncher;
-import androidx.activity.result.contract.ActivityResultContracts;
-import androidx.appcompat.app.AppCompatActivity;
+private const val LOGTAG = "[SmolLMAndroid-Kt]"
+private val LOGD: (String) -> Unit = { Log.d(LOGTAG, it) }
 
-import org.json.JSONException;
-import org.json.JSONObject;
-
-import java.io.IOException;
-
-import okhttp3.Call;
-import okhttp3.Callback;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-
-public class ContactResponseActivity extends AppCompatActivity {
-
-    private final OkHttpClient client = new OkHttpClient();
-    private String name;
-    private String phoneNumber;
-
-    // Create a launcher for starting activity for result
-    private final ActivityResultLauncher<Intent> addContactLauncher = registerForActivityResult(
-            new ActivityResultContracts.StartActivityForResult(),
-            result -> {
-                if (result.getResultCode() == RESULT_OK) {
-                    Toast.makeText(this, "Contact added successfully", Toast.LENGTH_SHORT).show();
-                } else {
-                    Toast.makeText(this, "Contact not added", Toast.LENGTH_SHORT).show();
-                }
-            });
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main);
-
-        Button getContactButton = findViewById(R.id.get_contact_button);
-        getContactButton.setOnClickListener(v -> {
-            // Call the API to get the response
-            getResponse();
-        });
+@KoinViewModel
+class ChatScreenViewModel(
+    val context: Context,
+    val messagesDB: MessagesDB,
+    val chatsDB: ChatsDB,
+    val modelsRepository: ModelsRepository,
+    val tasksDB: TasksDB,
+    val smolLMManager: SmolLMManager,
+) : ViewModel() {
+    enum class ModelLoadingState {
+        NOT_LOADED, // model loading not started
+        IN_PROGRESS, // model loading in-progress
+        SUCCESS, // model loading finished successfully
+        FAILURE, // model loading failed
     }
 
-    private void getResponse() {
-        // Example API request - replace with your actual API endpoint
-        String url = "https://api.example.com/contact-info";
-        Request request = new Request.Builder()
-                .url(url)
-                .build();
+    // UI state variables
+    private val _currChatState = MutableStateFlow<Chat?>(null)
+    val currChatState: StateFlow<Chat?> = _currChatState
 
-        client.newCall(request).enqueue(new Callback() {
-            @Override
-            public void onFailure(Call call, IOException e) {
-                runOnUiThread(() -> 
-                    Toast.makeText(ContactResponseActivity.this, 
-                                  "Failed to get response: " + e.getMessage(), 
-                                  Toast.LENGTH_SHORT).show()
-                );
+    private val _isGeneratingResponse = MutableStateFlow(false)
+    val isGeneratingResponse: StateFlow<Boolean> = _isGeneratingResponse
+
+    private val _modelLoadState = MutableStateFlow(ModelLoadingState.NOT_LOADED)
+    val modelLoadState: StateFlow<ModelLoadingState> = _modelLoadState
+
+    private val _partialResponse = MutableStateFlow("")
+    val partialResponse: StateFlow<String> = _partialResponse
+
+    private val _showSelectModelListDialogState = MutableStateFlow(false)
+    val showSelectModelListDialogState: StateFlow<Boolean> = _showSelectModelListDialogState
+
+    private val _showMoreOptionsPopupState = MutableStateFlow(false)
+    val showMoreOptionsPopupState: StateFlow<Boolean> = _showMoreOptionsPopupState
+
+    private val _showTaskListBottomListState = MutableStateFlow(false)
+    val showTaskListBottomListState: StateFlow<Boolean> = _showTaskListBottomListState
+
+    // Contact detection state and properties
+    private val _contactDetected = MutableStateFlow(false)
+    val contactDetected: StateFlow<Boolean> = _contactDetected
+
+    private var detectedContactName: String? = null
+    private var detectedContactPhone: String? = null
+    private var detectedContactEmail: String? = null
+
+    // Regex patterns for contact detection
+    private val namePattern = Pattern.compile("(?:name|contact)[\\s:-]+([\\w\\s]+)", Pattern.CASE_INSENSITIVE)
+    private val phonePattern = Pattern.compile("(?:phone|tel|mobile)[\\s:-]+(\\+?[\\d\\s()-]{7,})", Pattern.CASE_INSENSITIVE)
+    private val emailPattern = Pattern.compile("(?:email|e-mail)[\\s:-]+([\\w.-]+@[\\w.-]+\\.[a-z]{2,})", Pattern.CASE_INSENSITIVE)
+
+
+fun sendUserQuery(query: String) {
+        _currChatState.value?.let { chat ->
+            // Update the 'dateUsed' attribute of the current Chat instance
+            // when a query is sent by the user
+            chat.dateUsed = Date()
+            chatsDB.updateChat(chat)
+
+            if (chat.isTask) {
+                // If the chat is a 'task', delete all existing messages
+                // to maintain the 'stateless' nature of the task
+                messagesDB.deleteMessages(chat.id)
             }
 
-            @Override
-            public void onResponse(Call call, Response response) throws IOException {
-                if (!response.isSuccessful()) {
-                    runOnUiThread(() -> 
-                        Toast.makeText(ContactResponseActivity.this, 
-                                      "Unexpected response: " + response, 
-                                      Toast.LENGTH_SHORT).show()
-                    );
-                    return;
-                }
-
-                try {
-                    // Parse the response - adjust according to your actual response format
-                    String responseBody = response.body().string();
-                    JSONObject jsonResponse = new JSONObject(responseBody);
+            messagesDB.addUserMessage(chat.id, query)
+            _isGeneratingResponse.value = true
+            _partialResponse.value = ""
+            smolLMManager.getResponse(
+                query,
+                responseTransform = {
+                    // Replace <think> tags with <blockquote> tags
+                    // to get a neat Markdown rendering
+                    findThinkTagRegex.replace(it) { matchResult ->
+                        "<blockquote>${matchResult.groupValues[1]}</blockquote>"
+                    }
+                },
+                onPartialResponseGenerated = {
+                    _partialResponse.value = it
+                },
+                onSuccess = { response ->
+                    _isGeneratingResponse.value = false
+                    responseGenerationsSpeed = response.generationSpeed
+                    responseGenerationTimeSecs = response.generationTimeSecs
+                    chatsDB.updateChat(chat.copy(contextSizeConsumed = response.contextLengthUsed))
                     
-                    // Extract name and phone number - adjust the JSON keys as needed
-                    name = jsonResponse.getString("name");
-                    phoneNumber = jsonResponse.getString("phone");
-
-                    // Launch the contacts app from the main thread
-                    runOnUiThread(() -> launchContactsApp(name, phoneNumber));
-                    
-                } catch (JSONException e) {
-                    runOnUiThread(() -> 
-                        Toast.makeText(ContactResponseActivity.this, 
-                                      "Error parsing response: " + e.getMessage(), 
-                                      Toast.LENGTH_SHORT).show()
-                    );
-                }
-            }
-        });
-    }
-
-    private void launchContactsApp(String name, String phoneNumber) {
-        // Create intent to insert a new contact
-        Intent intent = new Intent(Intent.ACTION_INSERT);
-        intent.setType(ContactsContract.Contacts.CONTENT_TYPE);
-        
-        // Add the contact data
-        intent.putExtra(ContactsContract.Intents.Insert.NAME, name);
-        intent.putExtra(ContactsContract.Intents.Insert.PHONE, phoneNumber);
-        
-        // Check if there's an app that can handle this intent
-        if (intent.resolveActivity(getPackageManager()) != null) {
-            // Launch using the activity result launcher
-            addContactLauncher.launch(intent);
-        } else {
-            Toast.makeText(this, "No contacts app available", Toast.LENGTH_SHORT).show();
+                    // Process the response for contact information
+                    checkForContactInfo(response.text)
+                },
+                onCancelled = {
+                    // ignore CancellationException, as it was called because
+                    // `responseGenerationJob` was cancelled in the `stopGeneration` method
+                },
+                onError = { exception ->
+                    _isGeneratingResponse.value = false
+                    createAlertDialog(
+                        dialogTitle = "An error occurred",
+                        dialogText = "The app is unable to process the query. The error message is: ${exception.message}",
+                        dialogPositiveButtonText = "Change model",
+                        onPositiveButtonClick = {},
+                        dialogNegativeButtonText = "",
+                        onNegativeButtonClick = {},
+                    )
+                },
+            )
         }
     }
-}
+
+    // Check response for contact information
+    private fun checkForContactInfo(response: String) {
+        // Reset previous detection
+        _contactDetected.value = false
+        detectedContactName = null
+        detectedContactPhone = null
+        detectedContactEmail = null
+        
+        // Look for patterns in the response
+        val nameMatcher = namePattern.matcher(response)
+        val phoneMatcher = phonePattern.matcher(response)
+        val emailMatcher = emailPattern.matcher(response)
+        
+        if (nameMatcher.find()) {
+            detectedContactName = nameMatcher.group(1)?.trim()
+        }
+        
+        if (phoneMatcher.find()) {
+            detectedContactPhone = phoneMatcher.group(1)?.trim()
+        }
+        
+        if (emailMatcher.find()) {
+            detectedContactEmail = emailMatcher.group(1)?.trim()
+        }
+        
+        // If at least name and one other piece of info is detected, consider it a contact
+        if (detectedContactName != null && (detectedContactPhone != null || detectedContactEmail != null)) {
+            _contactDetected.value = true
+        }
+    }
+
+    // Launch contact add activity
+    fun addDetectedContact() {
+        val intent = Intent(context, ContactAddActivity::class.java).apply {
+            putExtra("CONTACT_NAME", detectedContactName ?: "")
+            putExtra("CONTACT_PHONE", detectedContactPhone ?: "")
+            putExtra("CONTACT_EMAIL", detectedContactEmail ?: "")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        ContextCompat.startActivity(context, intent, null)
+        
+        // Reset detection after launching activity
+        _contactDetected.value = false
+    }
